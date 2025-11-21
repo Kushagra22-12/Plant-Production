@@ -2,5 +2,5 @@ streamlit
 openpyxl
 pandas
 numpy
-plotly
-kaleido
+plotly>=6.1.1
+kaleido>=1.0.0
