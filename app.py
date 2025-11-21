@@ -1,39 +1,57 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import sys
 
-# --- Detect Plotly availability and version ---
+# --- Detect Plotly/Kaleido/Chrome availability ---
 PLOTLY_AVAILABLE = True
 KALEIDO_AVAILABLE = False
+CHROME_READY = False
 plotly_version = None
+kaleido_version = None
+
 try:
     import plotly
     import plotly.express as px
+    import plotly.io as pio
     plotly_version = plotly.__version__
-    # Check kaleido (for PNG downloads)
-    try:
-        import kaleido  # noqa: F401
-        KALEIDO_AVAILABLE = True
-    except Exception:
-        KALEIDO_AVAILABLE = False
 except Exception:
     PLOTLY_AVAILABLE = False
 
-st.set_page_config(page_title="Production Analytics — Main", layout="wide")
+if PLOTLY_AVAILABLE:
+    try:
+        import kaleido
+        kaleido_version = getattr(kaleido, '__version__', None)
+        KALEIDO_AVAILABLE = True
+        # Try to ensure Chrome (Kaleido v1+). Older Kaleido may not have get_chrome_sync
+        try:
+            if hasattr(kaleido, 'get_chrome_sync'):
+                kaleido.get_chrome_sync()  # downloads Chrome if not found
+                CHROME_READY = True
+            else:
+                # Plotly.io may expose get_chrome()
+                if hasattr(pio, 'get_chrome'):
+                    pio.get_chrome()
+                    CHROME_READY = True
+        except Exception:
+            CHROME_READY = False
+    except Exception:
+        KALEIDO_AVAILABLE = False
+
+st.set_page_config(page_title="Production Analytics — Main (v2)", layout="wide")
 
 # Sidebar diagnostics
 with st.sidebar.expander("Environment Diagnostics", expanded=False):
     st.write("**Python**:", sys.executable)
-    if PLOTLY_AVAILABLE:
-        st.success(f"Plotly available — v{plotly_version}")
-        st.write("Kaleido for PNG:", "✅" if KALEIDO_AVAILABLE else "❌")
-    else:
+    st.write("Plotly:", plotly_version if plotly_version else "Not available")
+    st.write("Kaleido:", kaleido_version if kaleido_version else "Not available")
+    st.write("Chrome for Kaleido:", "✅" if CHROME_READY else "❌")
+    if not PLOTLY_AVAILABLE:
         st.warning("Plotly not available — charts will use Streamlit natives.")
 
 @st.cache_data
 def load_data(upload):
-    # Load and clean the Production Summary Excel with dynamic header detection.
     raw = pd.read_excel(upload, sheet_name=0, header=None, engine='openpyxl')
     required_cols = {'Plant', 'Line', 'Grade'}
     header_idx = None
@@ -47,12 +65,10 @@ def load_data(upload):
 
     columns = [str(x).strip() for x in raw.iloc[header_idx].tolist()]
     df = raw.iloc[header_idx+1:].copy().reset_index(drop=True)
-    # Trim any extra columns beyond header length
     if df.shape[1] > len(columns):
         df = df.iloc[:, :len(columns)]
     df.columns = columns
 
-    # Tag totals vs details
     def classify_row(grade_val):
         if pd.isna(grade_val):
             return 'Unknown'
@@ -67,7 +83,6 @@ def load_data(upload):
 
     df['RowType'] = df['Grade'].map(classify_row)
 
-    # Normalize columns
     rename_map = {
         'Today Qty (No)': 'TodayQty',
         'Today Qty %': 'TodayQtyPct',
@@ -90,7 +105,6 @@ def load_data(upload):
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 
-    # Efficiency metrics
     if {'TodayKW','TodayQty'}.issubset(df.columns):
         df['TodayKW_per_Unit'] = np.where(df['TodayQty']>0, df['TodayKW']/df['TodayQty'], np.nan)
     if {'MTDKW','MTDQty'}.issubset(df.columns):
@@ -122,7 +136,6 @@ if file is None:
     st.info("Upload the Excel to begin.")
     st.stop()
 
-# Load
 try:
     df = load_data(file)
 except Exception as e:
@@ -235,7 +248,6 @@ with tab_overview:
 
     chart_type = st.selectbox("Chart type", options=["Bar", "Line", "Area"], index=0)
 
-    # Plant summary
     if 'Plant' in fdf.columns and qty_col in fdf.columns:
         plant_sum = fdf.groupby('Plant')[qty_col].sum().sort_values(ascending=False)
         if chart_type == 'Bar':
@@ -245,7 +257,6 @@ with tab_overview:
         else:
             plot_series_area(plant_sum, f"{metric_basis} Qty by Plant", "Plant", f"{metric_basis} Qty")
 
-    # Line summary by Plant
     if {'Plant','Line',qty_col}.issubset(fdf.columns):
         line_sum = fdf.groupby(['Plant','Line'])[qty_col].sum().reset_index()
         plot_df_bar(line_sum, x='Line', y=qty_col, color='Plant', title=f"{metric_basis} Qty by Line (grouped by Plant)", barmode='group')
@@ -266,7 +277,6 @@ with tab_grade:
     gtop = gvalues.head(topn)
     plot_series_bar(gtop, f"Top {topn} Grades — {y_lbl}", "Grade", y_lbl)
 
-    # Grade by Plant
     gp = fdf.groupby(['Plant','Grade'])[qty_col].sum().reset_index()
     if normalize:
         gp['Share'] = gp.groupby('Plant')[qty_col].apply(lambda s: s/s.sum()*100)
@@ -275,7 +285,6 @@ with tab_grade:
         y = qty_col; y_title = f"{metric_basis} Qty"
     plot_df_bar(gp, x='Plant', y=y, color='Grade', title=f"Grade mix by Plant ({y_title})", barmode='stack')
 
-    # Grade by Line (faceted by Plant) — Plotly only for facets; fallback with grouped bars per plant
     gl = fdf.groupby(['Plant','Line','Grade'])[qty_col].sum().reset_index()
     if PLOTLY_AVAILABLE:
         fig = px.bar(gl, x='Line', y=qty_col, color='Grade', facet_col='Plant', facet_col_wrap=2, title=f"Grade by Line (faceted by Plant)", barmode='stack')
@@ -301,7 +310,6 @@ with tab_eff:
         fig_e2.update_layout(yaxis_title=f"{metric_basis} KW/Unit")
         st.plotly_chart(fig_e2, use_container_width=True)
 
-        # Distribution boxplot by grade
         df_box = fdf.dropna(subset=[kw_per_unit_col])
         fig_box = px.box(df_box, x='Grade', y=kw_per_unit_col, points='outliers', title=f"Distribution of {metric_basis} KW per Unit by Grade")
         fig_box.update_layout(yaxis_title=f"{metric_basis} KW/Unit")
@@ -318,7 +326,6 @@ with tab_lines:
     line_sum = fdf.groupby(['Plant','Line'])[qty_col].sum().reset_index()
     plot_df_line(line_sum, x='Line', y=qty_col, color='Plant', title=f"{metric_basis} Qty across Lines (by Plant)")
 
-    # Area plot of Grade contributions per Line (Plotly preferred)
     gl = fdf.groupby(['Line','Grade'])[qty_col].sum().reset_index()
     if PLOTLY_AVAILABLE:
         fig_l2 = px.area(gl, x='Line', y=qty_col, color='Grade', title=f"Grade contributions per Line")
@@ -354,16 +361,35 @@ with tab_export:
     csv = fdf.to_csv(index=False).encode('utf-8')
     st.download_button("Download filtered data as CSV", data=csv, file_name="filtered_data.csv", mime="text/csv")
 
-    if PLOTLY_AVAILABLE and KALEIDO_AVAILABLE:
+    # Test PNG export readiness by trying a minimal image in memory
+    PNG_EXPORT_READY = False
+    if PLOTLY_AVAILABLE and KALEIDO_AVAILABLE and CHROME_READY:
+        try:
+            test_fig = px.line(x=[0,1], y=[0,1])
+            _ = test_fig.to_image(format='png')
+            PNG_EXPORT_READY = True
+        except Exception:
+            PNG_EXPORT_READY = False
+
+    if PNG_EXPORT_READY:
         st.caption("Download key charts as PNG")
-        # Example: Plant summary
         plant_sum = fdf.groupby('Plant')[qty_col].sum().sort_values(ascending=False)
-        fig_overview = px.bar(plant_sum, x=plant_sum.index, y=plant_sum.values, title=f"{metric_basis} Qty by Plant")
-        png_bytes = fig_overview.to_image(format='png')
-        st.download_button(label="Download overview_plant.png", data=png_bytes, file_name="overview_plant.png", mime="image/png")
-    elif PLOTLY_AVAILABLE and not KALEIDO_AVAILABLE:
-        st.caption("(Install 'kaleido' to enable figure downloads)")
+        try:
+            fig_overview = px.bar(plant_sum, x=plant_sum.index, y=plant_sum.values, title=f"{metric_basis} Qty by Plant")
+            png_bytes = fig_overview.to_image(format='png')
+            st.download_button(label="Download overview_plant.png", data=png_bytes, file_name="overview_plant.png", mime="image/png")
+        except Exception as e:
+            st.info(f"PNG export failed at runtime: {e}. Try installing Chrome for Kaleido and restart.")
     else:
-        st.caption("Plotly not available — figure downloads are disabled.")
+        st.caption("PNG export not available — download the interactive figure as HTML instead.")
+        if PLOTLY_AVAILABLE:
+            fig_overview = px.bar(fdf.groupby('Plant')[qty_col].sum().sort_values(ascending=False),
+                                  x=fdf.groupby('Plant')[qty_col].sum().sort_values(ascending=False).index,
+                                  y=fdf.groupby('Plant')[qty_col].sum().sort_values(ascending=False).values,
+                                  title=f"{metric_basis} Qty by Plant")
+            html_bytes = fig_overview.to_html(include_plotlyjs='cdn').encode('utf-8')
+            st.download_button(label="Download overview_plant.html", data=html_bytes, file_name="overview_plant.html", mime="text/html")
+        else:
+            st.caption("Plotly not available — figure downloads are disabled.")
 
 st.caption("Tip: Switch metric basis (MTD/Today) and toggle % normalization in the sidebar to change all views.")
